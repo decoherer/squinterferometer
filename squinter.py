@@ -12,7 +12,8 @@
 #   5. loss = beamsplitter to a fresh vacuum ancilla that is never detected (discarding is free in
 #      normal-ordered vacuum expectation — the partial trace happens automatically)
 
-from sympy import sqrt,exp,cos,sin,cosh,sinh,I,pi,Rational,sympify,symbols,diff,conjugate,simplify,pprint
+from sympy import sqrt,exp,sin,cos,sinh,cosh,tanh,I,pi,Rational
+from sympy import sympify,symbols,diff,conjugate,simplify,pprint,cancel,expand,expand_trig
 from sympy import Matrix,eye,zeros
 from sympy.physics.quantum.boson import BosonOp
 from sympy.physics.quantum import Dagger
@@ -41,7 +42,7 @@ def mziexample(α=None,β=None,ϕ0=None): # α,β = input amplitudes, ϕ0 = phas
     dNdϕ = diff(N,ϕ) # print('dN/dϕ',dNdϕ)
     ΔϕΔϕ = (ΔNΔN/dNdϕ**2).rewrite(exp,cos,sin).expand().simplify() # print('Δϕ²',ΔϕΔϕ)
     ΔϕΔϕ = ΔϕΔϕ if ϕ0 is None else ΔϕΔϕ.subs(ϕ,ϕ0)
-    print('Δϕ² = ΔN²/(dN/dϕ)²')
+    print('Δϕ² = ΔN²/(dN/dϕ)² =')
     pprint(ΔϕΔϕ)
     return ΔϕΔϕ
 
@@ -117,6 +118,8 @@ class Squinter:
         return self.element([mode],[[exp(I*ϕ)]])
     def bs(self,m1,m2,θ=pi/4): # θ=π/4: a'=(a−b)/√2, b'=(a+b)/√2, same convention as mziexample()
         return self.element([m1,m2],[[cos(θ),-sin(θ)],[sin(θ),cos(θ)]])
+    def beamsplitter(self,m1,m2,θ=pi/4):
+        return self.bs(m1,m2,θ=θ)
     def squeeze(self,mode,r,θ=0): # S†(ξ)aS(ξ) = a·cosh r − e^{iθ}a†·sinh r, ξ = r·e^{iθ}
         return self.element([mode],[[cosh(r)]],[[-exp(I*θ)*sinh(r)]])
     def opa(self,m1,m2,r,θ=0): # a' = a·cosh r + e^{iθ}b†·sinh r and a↔b; θ=0,+r matches OPA1,
@@ -147,18 +150,56 @@ class Squinter:
     def quad(self,mode,θlo=0): # homodyne quadrature X_θ at an output port
         A = self.outputmode(mode)
         return (exp(-I*θlo)*A+exp(I*θlo)*Dagger(A))/sqrt(2)
+    def Nstats(self,weights):
+        # ⟨O⟩ and ⟨ΔO²⟩ for O = Σₖ wₖ aₖ†aₖ directly from gaussian pair moments — no nof()
+        # aₖ' = uₖ+fₖ with n=⟨fₖ†f_l⟩, ñ=⟨fₖf_l†⟩, m=⟨fₖf_l⟩, m̄=⟨fₖ†f_l†⟩; wick gives
+        # Cov(Nₖ,N_l) = ūₖū_l m + uₖū_l n + ūₖu_l ñ + uₖu_l m̄ + m·m̄ + n·ñ
+        # conjugated coefficients are read from the dagger rows 2k+1 of M (honors element(real=True))
+        # exact for any linear chain and coherent inputs; |α|⁴ never forms, so float-safe by construction
+        if isinstance(weights,str): weights = [weights]
+        if not isinstance(weights,dict): weights = {l:1 for l in weights}
+        R = range(len(self.labels))
+        A  = {l:[self.M[2*self.index(l)  ,2*i  ] for i in R] for l in weights}
+        B  = {l:[self.M[2*self.index(l)  ,2*i+1] for i in R] for l in weights}
+        Ac = {l:[self.M[2*self.index(l)+1,2*i+1] for i in R] for l in weights}
+        Bc = {l:[self.M[2*self.index(l)+1,2*i  ] for i in R] for l in weights}
+        αs,αcs = [self.amps[l] for l in self.labels],[conjugate(self.amps[l]) for l in self.labels]
+        u  = {l:sum(A[l][i]*αs[i]+B[l][i]*αcs[i] for i in R) for l in weights}
+        uc = {l:sum(Ac[l][i]*αcs[i]+Bc[l][i]*αs[i] for i in R) for l in weights}
+        n  = lambda k,l: sum(Bc[k][i]*B[l][i] for i in R)  # ⟨fₖ†f_l⟩
+        ñ  = lambda k,l: sum(A[k][i]*Ac[l][i] for i in R)  # ⟨fₖf_l†⟩
+        m  = lambda k,l: sum(A[k][i]*B[l][i] for i in R)   # ⟨fₖf_l⟩
+        mc = lambda k,l: sum(Bc[k][i]*Ac[l][i] for i in R) # ⟨fₖ†f_l†⟩
+        mean = sum(w*(uc[l]*u[l]+n(l,l)) for l,w in weights.items())
+        var = sum(wk*wl*(uc[k]*uc[l]*m(k,l) + u[k]*uc[l]*n(k,l) + uc[k]*u[l]*ñ(k,l) + u[k]*u[l]*mc(k,l)
+                         + m(k,l)*mc(k,l) + n(k,l)*ñ(k,l))
+                  for k,wk in weights.items() for l,wl in weights.items())
+        return mean.expand(),var.expand()
     def ev(self,expr): # expectation value
         subs = {}
         for l in self.labels:
             a = BosonOp(l)
             subs[a],subs[Dagger(a)] = self.amps[l],conjugate(self.amps[l])
         return nof(expr).subs(subs)
-    def dphisqr(self,obs,ϕ,ϕ0=None,simplifyit=True): # Δϕ² = ⟨ΔO²⟩/(d⟨O⟩/dϕ)²
-        N = self.ev(obs)
-        NN = self.ev(obs*obs)
-        ΔNΔN = NN - N**2
+    # def dphisqr(self,obs,ϕ,ϕ0=None,simplifyit=False): # Δϕ² = ⟨ΔO²⟩/(d⟨O⟩/dϕ)²
+    #     N = self.ev(obs)
+    #     NN = self.ev(obs*obs)
+    #     ΔNΔN = (NN - N**2).expand()
+    #     dNdϕ = diff(N,ϕ)
+    #     ΔϕΔϕ = (ΔNΔN/dNdϕ**2).rewrite(exp,cos,sin).expand() # same post-processing as mziexample()/boostedexample()
+    #     ΔϕΔϕ = ΔϕΔϕ if not simplifyit else ΔϕΔϕ.simplify()
+    #     return ΔϕΔϕ if ϕ0 is None else ΔϕΔϕ.subs(ϕ,ϕ0)
+    def dphisqr(self,obs,ϕ,ϕ0=None,simplifyit=False): # Δϕ² = ⟨ΔO²⟩/(d⟨O⟩/dϕ)²
+        # obs may be an operator expression (legacy nof path), or mode weights for O = Σ wₖNₖ:
+        # a label, list of labels (wₖ=1), or dict {label:w} e.g. {'a':1,'b':-1} — gaussian path, no nof()
+        if isinstance(obs,(str,dict,list,tuple,set)):
+            N,ΔNΔN = self.Nstats(obs)
+        else:
+            N = self.ev(obs)
+            NN = self.ev(obs*obs)
+            ΔNΔN = (NN - N**2).expand() # expand cancels the |α|⁴ block exactly — float evaluation stays sane
         dNdϕ = diff(N,ϕ)
-        ΔϕΔϕ = (ΔNΔN/dNdϕ**2).rewrite(exp,cos,sin).expand() # same post-processing as mziexample()/boostedexample()
+        ΔϕΔϕ = (ΔNΔN/dNdϕ**2).rewrite(exp,cos,sin) # .expand() # same post-processing as mziexample()/boostedexample()
         if simplifyit: ΔϕΔϕ = ΔϕΔϕ.simplify()
         return ΔϕΔϕ if ϕ0 is None else ΔϕΔϕ.subs(ϕ,ϕ0)
     def check(self): # commutation preserved ⇔ MΩMᵀ = Ω; returns the zero matrix iff consistent
@@ -170,40 +211,78 @@ class Squinter:
         for i in range(n):
             Ω[2*i,2*i+1],Ω[2*i+1,2*i] = 1,-1
         return simplify(self.M*Ω*self.M.T-Ω)
+def tanhsimplify(e, r):
+    from sympy import symbols, sin, cos, sinh, cosh, tanh, cancel, expand, expand_trig
+    t = symbols('tanhr', positive=True)
+    return expand_trig(e).subs(sinh(r), t*cosh(r)).subs([(sin(x)**2, 1-cos(x)**2) for x in {w.args[0] for w in e.atoms(cos)}]).expand().cancel().subs(t, tanh(r))
+def sympy2float(expr, subs={}, dps=30, maxdps=480, rtol=1e-6, imtol=1e-4):
+    # subs: {symbol: value}; exact sympy values preferred, ints/floats accepted
+    # returns float(re) if converged and |im| ≤ imtol·|re|, else nan
+    # for parameter scans lift the lambdify out and reuse it — compile dominates per-call cost
+    import mpmath as mp
+    from numpy import nan
+    from sympy import sympify, lambdify, Expr
+    expr = sympify(expr).subs({k:v for k,v in subs.items() if isinstance(v,Expr)})
+    args = {k:v for k,v in subs.items() if not isinstance(v,Expr)}
+    syms = sorted(expr.free_symbols, key=str)
+    missing = [s for s in syms if s not in args]
+    assert not missing, f'unresolved: {missing}'
+    f = lambdify(syms, expr, 'mpmath')
+    def run(prec): # conversion and evaluation both at prec so escalation is end to end
+        with mp.workdps(prec):
+            return mp.mpc(f(*[mp.mpmathify(args[s]) for s in syms]))
+    try:
+        zprev = run(dps)
+        while True:
+            dps *= 2
+            z = run(dps)
+            if abs(z-zprev) <= rtol*(abs(z)+abs(zprev)): break # also catches exact 0
+            if dps >= maxdps: return nan # successive precisions disagree: report noise as nan
+            zprev = z
+    except ZeroDivisionError:
+        return nan # singular working point, e.g. dN/dφ = 0
+    return float(z.real) if abs(z.imag) <= imtol*(abs(z.real)+1e-99) else nan
 
-def mzi(α=None,β=None,ϕ0=None,simplifyit=True): # reproduces mziexample()
+def mzi(α=None,β=None,ϕ0=None): # reproduces mziexample()
     α = α if α is not None else symbols('α',real=True)
     β = β if β is not None else symbols('β',real=True)
     ϕ = symbols('ϕ',real=True)
-    c = Squinter().input('a',α).input('b',β).bs('a','b').phase('a',ϕ).bs('a','b')
-    return c.dphisqr(c.N('a'),ϕ,ϕ0,simplifyit)
+    sq = Squinter().input('a',α).input('b',β).bs('a','b').phase('a',ϕ).bs('a','b')
+    return sq.dphisqr(sq.N('a'),ϕ,ϕ0)
 
 def boosted(α=None,β=None,ϕ0=None): # reproduces boostedexample()
     α = α if α is not None else symbols('α',real=True)
     β = β if β is not None else symbols('β',real=True)
     r = symbols('r',positive=True)
     ϕ = symbols('ϕ',real=True)
-    c = Squinter().input('a',α).input('b',β).opa('a','b',r).phase('a',ϕ).opa('a','b',-r)
-    return c.dphisqr(c.N('a','b'),ϕ,ϕ0,simplifyit=False)
+    sq = Squinter().input('a',α).input('b',β).opa('a','b',r).phase('a',ϕ).opa('a','b',-r)
+    return sq.dphisqr(sq.N('a','b'),ϕ,ϕ0,simplifyit=0)
 
-def mzisqueezed(ϕ0=None,simplifyit=False): # Caves config: coherent + squeezed vacuum, difference detection
+def degenboosted(α=None,θ=0,ϕ0=None):
+    α = α if α is not None else symbols('α',real=True)
+    r = symbols('r',positive=True)
+    ϕ = symbols('ϕ',real=True)
+    sq = Squinter().input('a',α).squeeze('a',r,θ).phase('a',ϕ).squeeze('a',-r,θ)
+    return sq.dphisqr(sq.N('a'),ϕ,ϕ0,simplifyit=0)
+
+def mzisqueezed(ϕ0=None): # Caves config: coherent + squeezed vacuum, difference detection
     α = symbols('α',real=True)
     r = symbols('r',positive=True)
     θ,ϕ = symbols('θ ϕ',real=True)
-    c = (Squinter().input('a',α)
+    sq = (Squinter().input('a',α)
                   .input('b',0).squeeze('b',r,θ)
                   .bs('a','b').phase('a',ϕ).bs('a','b'))
-    return c.dphisqr(c.N('a')-c.N('b'),ϕ,ϕ0,simplifyit)
+    return sq.dphisqr(sq.N('a')-sq.N('b'),ϕ,ϕ0,simplifyit=0)
 
 def mzilossy(ϕ0=None): # coherent only, equal internal loss η both arms ⇒ exactly (lossless result)/η
     α = symbols('α',real=True)
     η = symbols('η',positive=True)
     ϕ = symbols('ϕ',real=True)
-    c = (Squinter().input('a',α).input('b',0)
+    sq = (Squinter().input('a',α).input('b',0)
                   .bs('a','b').phase('a',ϕ)
                   .loss('a',η).loss('b',η)
                   .bs('a','b'))
-    return c.dphisqr(c.N('a'),ϕ,ϕ0,simplifyit=False)
+    return sq.dphisqr(sq.N('a'),ϕ,ϕ0)
 
 if __name__ == '__main__':
     mziexample()
@@ -215,10 +294,11 @@ if __name__ == '__main__':
     print('SU(1,1), vacuum seeded, ϕ→0 (expect 1/sinh²(2r), Plick15):')
     pprint(boosted(α=0,β=0).limit(ϕ,0))
     print('MZI, coherent + squeezed vacuum, N_a−N_b at ϕ0=π/2, θ=0 and θ=π:')
-    Δ = mzisqueezed(ϕ0=pi/2)
-    pprint(Δ.subs(θ,0).simplify())
-    pprint(Δ.subs(θ,pi).simplify())
-    # checks: Δ.subs(r,0) must reduce to the coherent case; at the better θ the large-α expansion
+    dd = mzisqueezed(ϕ0=pi/2)
+    pprint(dd.subs(θ,0).simplify())
+    pprint(dd.subs(θ,pi).simplify())
+    # checks: dd.subs(r,0) must reduce to the coherent case; at the better θ the large-α expansion
     # should give e^{−2r}/α² + O(sinh²r/α⁴) (Caves 1981)
     # symplectic sanity for any chain: assert c.check().is_zero_matrix
     # mzilossy(ϕ0=pi/2) should equal the lossless coherent result divided by η
+
